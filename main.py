@@ -26,7 +26,6 @@ def load_local_aeds():
         except Exception:
             pass
 
-# Wczytanie bazy przy starcie
 load_local_aeds()
 
 @app.get("/")
@@ -34,59 +33,78 @@ def health():
     return {
         "status": "ok",
         "total_aeds_loaded": len(ALL_AEDS),
-        "instrukcja": "Wejdz na /pobierz-baze aby jednorazowo pobrac 17k punktow z Polski."
+        "instrukcja": "Wejdz na /pobierz-baze aby pobrac punkty z Polski."
     }
 
-# Specjalny endpoint, który sam pobierze dane w chmurze
 @app.get("/pobierz-baze")
 def pobierz_baze():
     global ALL_AEDS
+    
+    # Zapytanie o defibrylatory w Polsce
     query = """
-    [out:json][timeout:90];
+    [out:json][timeout:60];
     area["ISO3166-1"="PL"][admin_level=2]->.polska;
     (
       nwr["emergency"="defibrillator"](area.polska);
     );
     out center tags;
     """
-    url = "https://overpass-api.de/api/interpreter"
-    headers = {"User-Agent": "PobieraczAED_Trening/1.0"}
     
-    try:
-        res = requests.post(url, data={"data": query}, headers=headers, timeout=120)
-        elements = res.json().get("elements", [])
+    # Lista niezależnych serwerów w Europie, które nie blokują Render
+    mirrors = [
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass.private.coffee/api/interpreter",
+        "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
+    ]
+    
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AEDFetcher/1.0"}
+    
+    elements = []
+    last_error = ""
+    
+    for url in mirrors:
+        try:
+            res = requests.post(url, data={"data": query}, headers=headers, timeout=60)
+            if res.status_code == 200:
+                elements = res.json().get("elements", [])
+                if elements:
+                    break
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    if not elements:
+        return {"status": "blad", "komunikat": f"Wszystkie serwery zawiodly. Ostatni blad: {last_error}"}
+
+    cleaned = []
+    for el in elements:
+        lat = el.get("lat") or el.get("center", {}).get("lat")
+        lon = el.get("lon") or el.get("center", {}).get("lon")
+        if not lat or not lon:
+            continue
         
-        cleaned = []
-        for el in elements:
-            lat = el.get("lat") or el.get("center", {}).get("lat")
-            lon = el.get("lon") or el.get("center", {}).get("lon")
-            if not lat or not lon:
-                continue
+        tags = el.get("tags", {})
+        name = tags.get("name") or tags.get("operator") or ""
+        location = tags.get("defibrillator:location") or tags.get("description") or ""
+        access = tags.get("access") or ""
+        
+        parts = [p for p in [name, location] if p]
+        desc = ", ".join(parts) if parts else "przy wejściu głównym do obiektu"
+        
+        if access and access not in ["yes", "public"]:
+            desc += f" (dostęp: {access})"
             
-            tags = el.get("tags", {})
-            name = tags.get("name") or tags.get("operator") or ""
-            location = tags.get("defibrillator:location") or tags.get("description") or ""
-            access = tags.get("access") or ""
-            
-            parts = [p for p in [name, location] if p]
-            desc = ", ".join(parts) if parts else "przy wejściu głównym do obiektu"
-            
-            if access and access not in ["yes", "public"]:
-                desc += f" (dostęp: {access})"
-                
-            cleaned.append({
-                "lat": round(float(lat), 5),
-                "lon": round(float(lon), 5),
-                "desc": desc
-            })
-            
-        with open(JSON_PATH, "w", encoding="utf-8") as f:
-            json.dump(cleaned, f, ensure_ascii=False)
-            
-        ALL_AEDS = cleaned
-        return {"status": "sukces", "pobranych_urzadzen": len(cleaned)}
-    except Exception as e:
-        return {"status": "blad", "komunikat": str(e)}
+        cleaned.append({
+            "lat": round(float(lat), 5),
+            "lon": round(float(lon), 5),
+            "desc": desc
+        })
+        
+    with open(JSON_PATH, "w", encoding="utf-8") as f:
+        json.dump(cleaned, f, ensure_ascii=False)
+        
+    ALL_AEDS = cleaned
+    return {"status": "sukces", "pobranych_urzadzen": len(cleaned)}
 
 @app.post("/find-aed")
 async def find_aed(request: Request):
@@ -104,7 +122,6 @@ async def find_aed(request: Request):
     if not address:
         return {"status": "error", "message": "Brak adresu"}
 
-    # 1. Błyskawiczne geokodowanie adresu
     headers = {"User-Agent": "MedycznyBotTreningowy/1.0"}
     lat, lon = None, None
     try:
@@ -128,7 +145,6 @@ async def find_aed(request: Request):
     if not ALL_AEDS:
         return {"status": "error", "message": "Baza AED jest pusta. Wejdz na /pobierz-baze."}
 
-    # 2. Szybkie przefiltrowanie okolicy (+/- 0.08 stopnia to ok. 8-9 km)
     lat_min, lat_max = lat - 0.08, lat + 0.08
     lon_min, lon_max = lon - 0.12, lon + 0.12
 
@@ -139,7 +155,6 @@ async def find_aed(request: Request):
 
     pool = local_candidates if local_candidates else ALL_AEDS
 
-    # Wybór najbliższego
     nearest = min(pool, key=lambda aed: calculate_distance(lat, lon, aed["lat"], aed["lon"]))
     dist = calculate_distance(lat, lon, nearest["lat"], nearest["lon"])
 
