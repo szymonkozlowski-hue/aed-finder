@@ -33,78 +33,56 @@ def health():
     return {
         "status": "ok",
         "total_aeds_loaded": len(ALL_AEDS),
-        "instrukcja": "Wejdz na /pobierz-baze aby pobrac punkty z Polski."
+        "instrukcja": "Wejdz na /pobierz-baze aby pobrac oficjalna baze OpenAEDMap."
     }
 
 @app.get("/pobierz-baze")
 def pobierz_baze():
     global ALL_AEDS
+    # Oficjalne, bezposrednie zrodlo ze Stowarzyszenia OpenStreetMap Polska
+    url = "https://openaedmap.org/api/v1/countries/PL.geojson"
+    headers = {"User-Agent": "MedycznyBotTreningowy/1.0"}
     
-    # Zapytanie o defibrylatory w Polsce
-    query = """
-    [out:json][timeout:60];
-    area["ISO3166-1"="PL"][admin_level=2]->.polska;
-    (
-      nwr["emergency"="defibrillator"](area.polska);
-    );
-    out center tags;
-    """
-    
-    # Lista niezależnych serwerów w Europie, które nie blokują Render
-    mirrors = [
-        "https://overpass.kumi.systems/api/interpreter",
-        "https://overpass.private.coffee/api/interpreter",
-        "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
-    ]
-    
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AEDFetcher/1.0"}
-    
-    elements = []
-    last_error = ""
-    
-    for url in mirrors:
-        try:
-            res = requests.post(url, data={"data": query}, headers=headers, timeout=60)
-            if res.status_code == 200:
-                elements = res.json().get("elements", [])
-                if elements:
-                    break
-        except Exception as e:
-            last_error = str(e)
-            continue
-
-    if not elements:
-        return {"status": "blad", "komunikat": f"Wszystkie serwery zawiodly. Ostatni blad: {last_error}"}
-
-    cleaned = []
-    for el in elements:
-        lat = el.get("lat") or el.get("center", {}).get("lat")
-        lon = el.get("lon") or el.get("center", {}).get("lon")
-        if not lat or not lon:
-            continue
-        
-        tags = el.get("tags", {})
-        name = tags.get("name") or tags.get("operator") or ""
-        location = tags.get("defibrillator:location") or tags.get("description") or ""
-        access = tags.get("access") or ""
-        
-        parts = [p for p in [name, location] if p]
-        desc = ", ".join(parts) if parts else "przy wejściu głównym do obiektu"
-        
-        if access and access not in ["yes", "public"]:
-            desc += f" (dostęp: {access})"
+    try:
+        res = requests.get(url, headers=headers, timeout=30)
+        if res.status_code != 200:
+            return {"status": "blad", "komunikat": f"Serwer OpenAED odpowiedzial kodem {res.status_code}"}
             
-        cleaned.append({
-            "lat": round(float(lat), 5),
-            "lon": round(float(lon), 5),
-            "desc": desc
-        })
+        data = res.json()
+        features = data.get("features", [])
         
-    with open(JSON_PATH, "w", encoding="utf-8") as f:
-        json.dump(cleaned, f, ensure_ascii=False)
-        
-    ALL_AEDS = cleaned
-    return {"status": "sukces", "pobranych_urzadzen": len(cleaned)}
+        cleaned = []
+        for feat in features:
+            geom = feat.get("geometry", {})
+            coords = geom.get("coordinates", [])
+            # W GeoJSON kolejnosc to [lon, lat]
+            if len(coords) >= 2:
+                lon, lat = float(coords[0]), float(coords[1])
+                props = feat.get("properties", {})
+                
+                name = props.get("operator") or props.get("name") or ""
+                loc = props.get("defibrillator:location") or props.get("description") or ""
+                access = props.get("access") or ""
+                
+                parts = [p for p in [name, loc] if p]
+                desc = ", ".join(parts) if parts else "w obiekcie publicznym"
+                
+                if access and access not in ["yes", "public"]:
+                    desc += f" (dostęp: {access})"
+                    
+                cleaned.append({
+                    "lat": round(lat, 5),
+                    "lon": round(lon, 5),
+                    "desc": desc
+                })
+                
+        with open(JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(cleaned, f, ensure_ascii=False)
+            
+        ALL_AEDS = cleaned
+        return {"status": "sukces", "pobranych_urzadzen": len(cleaned)}
+    except Exception as e:
+        return {"status": "blad", "komunikat": str(e)}
 
 @app.post("/find-aed")
 async def find_aed(request: Request):
@@ -122,13 +100,14 @@ async def find_aed(request: Request):
     if not address:
         return {"status": "error", "message": "Brak adresu"}
 
+    # 1. Geokodowanie adresu
     headers = {"User-Agent": "MedycznyBotTreningowy/1.0"}
     lat, lon = None, None
     try:
         geo = requests.get(
             "https://nominatim.openstreetmap.org/search",
             params={"q": address, "format": "json", "limit": 1, "countrycodes": "pl"},
-            headers=headers, timeout=2.0
+            headers=headers, timeout=2.5
         ).json()
         if geo:
             lat = float(geo[0]["lat"])
@@ -139,27 +118,40 @@ async def find_aed(request: Request):
     if lat is None:
         return {
             "status": "not_found",
-            "message": "Nie udało się ustalić współrzędnych. Skup się na uciskaniu klatki piersiowej."
+            "message": "Nie udało się zlokalizować adresu w bazie. Prowadź RKO."
         }
 
     if not ALL_AEDS:
-        return {"status": "error", "message": "Baza AED jest pusta. Wejdz na /pobierz-baze."}
+        return {"status": "error", "message": "Baza AED nie jest zaladowana."}
 
-    lat_min, lat_max = lat - 0.08, lat + 0.08
-    lon_min, lon_max = lon - 0.12, lon + 0.12
+    # 2. Szukamy wyłacznie w promieniu maksymalnie 2.5 km (dla pieszych/samochodu to rozsądny dystans)
+    # Wstępna siatka: +/- 0.03 stopnia (~2.5-3 km)
+    lat_min, lat_max = lat - 0.035, lat + 0.035
+    lon_min, lon_max = lon - 0.045, lon + 0.045
 
     local_candidates = [
         aed for aed in ALL_AEDS 
         if lat_min <= aed["lat"] <= lat_max and lon_min <= aed["lon"] <= lon_max
     ]
 
-    pool = local_candidates if local_candidates else ALL_AEDS
+    # Obliczamy odległości
+    nearby_list = []
+    for aed in local_candidates:
+        dist = calculate_distance(lat, lon, aed["lat"], aed["lon"])
+        if dist <= 2500:  # Tylko urządzenia do 2,5 km
+            nearby_list.append((dist, aed))
 
-    nearest = min(pool, key=lambda aed: calculate_distance(lat, lon, aed["lat"], aed["lon"]))
-    dist = calculate_distance(lat, lon, nearest["lat"], nearest["lon"])
+    if not nearby_list:
+        return {
+            "status": "not_found",
+            "message": "Brak defibrylatora AED w bezpośrednim zasięgu (promień 2,5 km). Skup się na uciskaniu klatki piersiowej."
+        }
+
+    nearby_list.sort(key=lambda x: x[0])
+    best_dist, best_aed = nearby_list[0]
 
     return {
         "status": "success",
-        "odleglosc_metry": dist,
-        "lokalizacja": nearest["desc"]
+        "odleglosc_metry": best_dist,
+        "lokalizacja": best_aed["desc"]
     }
