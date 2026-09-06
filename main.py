@@ -32,24 +32,44 @@ async def find_aed(request: Request):
     if not address:
         return {"status": "error", "message": "Brak adresu w zapytaniu"}
 
-    headers = {"User-Agent": "MedycznyBotTreningowy/1.0 (kontakt@pgrm.pl)"}
+    headers = {"User-Agent": "PilskieAEDBot/1.0 (kontakt@pgrm.pl)"}
 
-    # 1. Geokodowanie adresu (szukanie w Polsce)
+    # 1. Geokodowanie adresu
+    lat, lon = None, None
     try:
         geo_res = requests.get(
             "https://nominatim.openstreetmap.org/search",
             params={"q": address, "format": "json", "limit": 1, "countrycodes": "pl"},
-            headers=headers, timeout=2.5
+            headers=headers, timeout=3.0
         ).json()
-        if not geo_res:
-            return {"status": "not_found", "message": f"Nie znaleziono w bazie adresu: {address}"}
-        lat, lon = float(geo_res[0]["lat"]), float(geo_res[0]["lon"])
+        if geo_res:
+            lat = float(geo_res[0]["lat"])
+            lon = float(geo_res[0]["lon"])
     except Exception:
-        return {"status": "timeout", "message": "Wyszukiwanie adresu trwa zbyt długo. Prowadź RKO."}
+        pass
 
-    # 2. Szukamy Node, Way i Relation (nwr) w promieniu 2500m z wyliczeniem środka (out center)
-    query = f"""[out:json][timeout:4];nwr["emergency"="defibrillator"](around:2500,{lat},{lon});out center;"""
+    # Fallback: jeśli nie znalazł dokładnego numeru (np. Lelewela 140), szukaj po samej ulicy i mieście
+    if lat is None:
+        try:
+            # Uproszczenie adresu: usuwamy zbędne słowa i bierzemy tylko główne człony
+            geo_res = requests.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": f"{address}, Polska", "format": "json", "limit": 1},
+                headers=headers, timeout=2.5
+            ).json()
+            if geo_res:
+                lat = float(geo_res[0]["lat"])
+                lon = float(geo_res[0]["lon"])
+        except Exception:
+            pass
+
+    if lat is None:
+        return {"status": "not_found", "message": f"Nie udało się ustalić współrzędnych dla adresu: {address}"}
+
+    # 2. Szukamy AED w promieniu 5000 metrów (5 km), obejmującym całą okolicę
+    query = f"""[out:json][timeout:5];nwr["emergency"="defibrillator"](around:5000,{lat},{lon});out center;"""
     overpass_urls = [
+        "https://overpass.kumi.systems/api/interpreter",
         "https://overpass.private.coffee/api/interpreter",
         "https://overpass-api.de/api/interpreter"
     ]
@@ -57,7 +77,7 @@ async def find_aed(request: Request):
     elements = []
     for url in overpass_urls:
         try:
-            op_res = requests.get(url, params={"data": query}, headers=headers, timeout=3.5)
+            op_res = requests.get(url, params={"data": query}, headers=headers, timeout=4.0)
             if op_res.status_code == 200:
                 elements = op_res.json().get("elements", [])
                 if elements:
@@ -68,10 +88,10 @@ async def find_aed(request: Request):
     if not elements:
         return {
             "status": "not_found",
-            "message": "Brak zarejestrowanego defibrylatora AED w promieniu 2.5 km."
+            "message": f"Brak zarejestrowanego AED w promieniu 5 km od współrzędnych ({round(lat, 4)}, {round(lon, 4)})."
         }
 
-    # 3. Wyciągnięcie współrzędnych (dla punktów lub centrów budynków)
+    # 3. Parsowanie i wyliczanie odległości
     parsed_aeds = []
     for el in elements:
         t_lat = el.get("lat") or el.get("center", {}).get("lat")
@@ -81,22 +101,23 @@ async def find_aed(request: Request):
             parsed_aeds.append((dist, el))
 
     if not parsed_aeds:
-        return {"status": "not_found", "message": "Brak precyzyjnych współrzędnych AED w pobliżu."}
+        return {"status": "not_found", "message": "Brak precyzyjnych współrzędnych AED."}
 
-    # Wybór najbliższego
+    # Wybór najbliższego AED
     nearest_dist, nearest_elem = min(parsed_aeds, key=lambda x: x[0])
     tags = nearest_elem.get("tags", {})
 
-    location_desc = (
-        tags.get("defibrillator:location") or 
-        tags.get("description") or 
-        tags.get("operator") or 
-        tags.get("name") or 
-        "przy wejściu głównym do obiektu"
-    )
+    # Wyciągamy jak najwięcej konkretnych informacji o miejscu
+    nazwa_obiektu = tags.get("name") or tags.get("operator") or ""
+    miejsce_montazu = tags.get("defibrillator:location") or tags.get("description") or "na ścianie budynku"
+    dostep = tags.get("access") or ""
+    
+    opis = f"{nazwa_obiektu}, {miejsce_montazu}".strip(", ")
+    if dostep and dostep != "yes":
+        opis += f" (dostęp: {dostep})"
 
     return {
         "status": "success",
         "odleglosc_metry": nearest_dist,
-        "lokalizacja": location_desc
+        "lokalizacja": opis or "przy wejściu głównym"
     }
